@@ -1,0 +1,142 @@
+// This is your Prisma schema file
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+model Organization {
+  id            String      @id @default(uuid())
+  name          String
+  clerkOrgId    String      @unique
+  phoneNumber   String      // Outbound phone number for calls
+  timezone      String      // Organization timezone
+  maxConcurrentCalls Int    @default(20) // Max concurrent outbound calls
+  createdAt     DateTime    @default(now())
+  updatedAt     DateTime    @updatedAt
+  campaigns     Campaign[]
+  users         User[]
+  runs          Run[]
+  patients      Patient[]
+
+  @@map("organizations")
+}
+
+model User {
+  id           String       @id @default(uuid())
+  clerkUserId  String      @unique
+  email        String      @unique
+  role         UserRole    @default(MEMBER)
+  organization Organization @relation(fields: [orgId], references: [id])
+  orgId        String
+  createdAt    DateTime    @default(now())
+  updatedAt    DateTime    @updatedAt
+
+  @@map("users")
+}
+
+model Campaign {
+  id            String       @id @default(uuid())
+  name          String
+  agentId       String      // Retail AI agent ID
+  organization  Organization @relation(fields: [orgId], references: [id])
+  orgId         String
+  variables     Json?       // Campaign-specific variables for Retail AI
+  runs          Run[]
+  createdAt     DateTime    @default(now())
+  updatedAt     DateTime    @updatedAt
+
+  @@map("campaigns")
+}
+
+model Run {
+  id               String       @id @default(uuid())
+  name             String
+  campaign         Campaign     @relation(fields: [campaignId], references: [id])
+  campaignId       String
+  organization     Organization @relation(fields: [orgId], references: [id])
+  orgId            String
+  status           RunStatus    @default(PENDING)
+  rawFileUrl       String?     // S3 URL of raw uploaded file
+  processedFileUrl String?     // S3 URL of processed file
+  dynamoTableName  String?     // DynamoDB table for active run data
+  scheduledStart   DateTime?   // When to automatically start the run
+  totalRecords     Int        @default(0)
+  validRecords     Int        @default(0)
+  invalidRecords   Int        @default(0)
+  activeCalls     Int        @default(0) // Current number of active calls
+  createdAt       DateTime    @default(now())
+  updatedAt       DateTime    @updatedAt
+  calls           Call[]
+  patients        Patient[]   // Many-to-many relationship for patients in this run
+
+  @@map("runs")
+}
+
+model Patient {
+  id            String       @id @default(uuid())
+  hash          String      @unique // SHA256 hash for deduplication
+  firstName     String
+  lastName      String
+  phone         String
+  dob           DateTime
+  isMinor       Boolean     @default(false)
+  organization  Organization @relation(fields: [orgId], references: [id])
+  orgId         String
+  runs          Run[]       // Many-to-many relationship with runs
+  calls         Call[]      // One-to-many relationship with calls
+  createdAt     DateTime    @default(now())
+  updatedAt     DateTime    @updatedAt
+
+  @@map("patients")
+}
+
+model Call {
+  id            String       @id @default(uuid())
+  run           Run          @relation(fields: [runId], references: [id])
+  runId         String
+  patient       Patient      @relation(fields: [patientId], references: [id])
+  patientId     String
+  status        CallStatus   @default(PENDING)
+  direction     CallDirection @default(OUTBOUND)
+  callLogUrl    String?     // S3 URL of full call log JSON
+  rawWebhookUrl String?     // S3 URL of raw webhook JSON
+  variables     Json?       // Variables used in the call (appointment details etc)
+  result        Json?       // Call analysis result from webhook
+  startTime     DateTime?
+  endTime       DateTime?
+  createdAt     DateTime    @default(now())
+  updatedAt     DateTime    @updatedAt
+
+  @@map("calls")
+}
+
+enum UserRole {
+  ADMIN
+  MEMBER
+}
+
+enum RunStatus {
+  PENDING     // Initial state after creation
+  PROCESSING  // Processing uploaded file
+  READY       // Ready to start (processed file available)
+  RUNNING     // Actively making calls
+  PAUSED      // Temporarily paused
+  COMPLETED   // All calls finished
+  FAILED      // Run failed
+}
+
+enum CallStatus {
+  PENDING
+  IN_PROGRESS
+  COMPLETED
+  FAILED
+}
+
+enum CallDirection {
+  INBOUND
+  OUTBOUND
+}
