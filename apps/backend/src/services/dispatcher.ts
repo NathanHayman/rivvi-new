@@ -1,186 +1,80 @@
-import { logger } from "@/utils/logger";
-import { prisma } from "@/utils/prisma";
-import { CallService } from "./call";
-import { RunStateManager, RunStatus } from "./run-state";
 
-const BATCH_SIZE = 10; // Number of calls to process at once
+```typescript
+import { DynamoDBClient, QueryCommand, UpdateItemCommand } from '@aws-sdk/client-dynamodb';
+import { RetellClient } from './retell'; // You'll need to implement this
 
-export class Dispatcher {
-  private callService: CallService;
-  private runStateManager: RunStateManager;
+export class DispatcherService {
+  private dynamoClient: DynamoDBClient;
+  private retellClient: RetellClient;
+  private MAX_CONCURRENT_CALLS = 20;
 
   constructor() {
-    this.callService = new CallService();
-    this.runStateManager = new RunStateManager();
+    this.dynamoClient = new DynamoDBClient({});
+    this.retellClient = new RetellClient();
   }
 
-  async processRun(runId: string) {
-    try {
-      // Get run details
-      const run = await prisma.run.findUnique({
-        where: { id: runId },
-        include: {
-          campaign: true,
-          organization: true,
-          patients: {
-            include: {
-              calls: {
-                where: { runId },
-              },
-            },
-          },
-        },
-      });
+  async dispatchCalls(runId: string, orgId: string) {
+    // Get current active calls count
+    const activeCalls = await this.getActiveCalls(orgId);
+    
+    // Calculate how many new calls we can make
+    const availableSlots = this.MAX_CONCURRENT_CALLS - activeCalls;
+    if (availableSlots <= 0) return;
 
-      if (!run) {
-        throw new Error(`Run ${runId} not found`);
-      }
+    // Get next batch of calls to make
+    const callBatch = await this.getNextBatch(runId, availableSlots);
 
-      // Initialize run state if not exists
-      let runState = await this.runStateManager.getState(runId);
-      if (!runState) {
-        runState = await this.runStateManager.initializeState(
-          runId,
-          run.campaignId,
-          run.orgId
-        );
-      }
-
-      // Process patients in batches
-      const pendingPatients = run.patients.filter(
-        (patient: any) => patient.calls.length === 0
-      );
-
-      for (let i = 0; i < pendingPatients.length; i += BATCH_SIZE) {
-        const batch = pendingPatients.slice(i, i + BATCH_SIZE);
-
-        // Check active calls against organization limit
-        const currentState = await this.runStateManager.getState(runId);
-        if (!currentState) {
-          throw new Error(`Run state not found for ${runId}`);
-        }
-
-        const maxConcurrentCalls = run.organization.maxConcurrentCalls || 5;
-        if (currentState.activeCalls >= maxConcurrentCalls) {
-          logger.info(
-            {
-              runId,
-              activeCalls: currentState.activeCalls,
-              maxConcurrentCalls,
-            },
-            "Max concurrent calls reached, waiting..."
-          );
-          await new Promise((resolve) => setTimeout(resolve, 1000));
-          continue;
-        }
-
-        // Calculate how many more calls we can make
-        const availableSlots = maxConcurrentCalls - currentState.activeCalls;
-        const batchToProcess = batch.slice(0, availableSlots);
-
-        // Dispatch calls for batch
-        await Promise.all(
-          batchToProcess.map(async (patient: any) => {
-            try {
-              // Increment active calls before dispatching
-              await this.runStateManager.updateState(runId, {
-                activeCalls: currentState.activeCalls + 1,
-                totalCalls: currentState.totalCalls + 1,
-              });
-
-              await this.dispatchCallForPatient(run, patient);
-            } catch (error) {
-              // Decrement active calls on error
-              await this.runStateManager.updateState(runId, {
-                activeCalls: currentState.activeCalls,
-                failedCalls: currentState.failedCalls + 1,
-              });
-
-              logger.error(
-                { error, runId, patientId: patient.id },
-                "Error dispatching call"
-              );
-            }
-          })
-        );
-
-        // Check if run should be paused
-        const updatedState = await this.runStateManager.getState(runId);
-        if (!updatedState || updatedState.status === RunStatus.PAUSED) {
-          logger.info({ runId }, "Run paused, stopping dispatch");
-          break;
-        }
-
-        // Rate limiting delay between batches
-        await new Promise((resolve) => setTimeout(resolve, 200));
-      }
-
-      // Check if all calls are completed
-      const completedState = await this.runStateManager.getState(runId);
-      if (
-        completedState &&
-        completedState.activeCalls === 0 &&
-        completedState.completedCalls + completedState.failedCalls ===
-          completedState.totalCalls
-      ) {
-        await this.runStateManager.updateState(runId, {
-          status: RunStatus.COMPLETED,
-          lastUpdated: new Date().toISOString(),
-        });
-
-        // Update RDS status
-        await prisma.run.update({
-          where: { id: runId },
-          data: { status: "COMPLETED" },
-        });
-      }
-    } catch (error) {
-      logger.error({ error, runId }, "Error processing run");
-      await Promise.all([
-        this.runStateManager.updateState(runId, {
-          status: RunStatus.FAILED,
-          lastUpdated: new Date().toISOString(),
-        }),
-        prisma.run.update({
-          where: { id: runId },
-          data: { status: "FAILED" },
-        }),
-      ]);
-      throw error;
+    // Dispatch calls
+    for (const call of callBatch) {
+      await this.dispatchCall(call, runId, orgId);
     }
   }
 
-  private async dispatchCallForPatient(run: any, patient: any): Promise<void> {
-    try {
-      // Get campaign variables for the patient
-      const variables = {
-        firstName: patient.firstName,
-        lastName: patient.lastName,
-        dateOfBirth: patient.dateOfBirth,
-        isMinor: patient.isMinor,
-        ...run.campaign.variables,
-      };
+  private async getActiveCalls(orgId: string) {
+    const result = await this.dynamoClient.send(new QueryCommand({
+      TableName: process.env.ACTIVE_CALLS_TABLE,
+      KeyConditionExpression: 'org_id = :orgId',
+      ExpressionAttributeValues: {
+        ':orgId': { S: orgId }
+      }
+    }));
 
-      // Dispatch call
-      await this.callService.dispatchCall({
-        runId: run.id,
-        patientId: patient.id,
-        phoneNumber: patient.phone,
-        agentId: run.campaign.agentId,
-        variables,
-        direction: "OUTBOUND",
-      });
+    return result.Items?.length || 0;
+  }
 
-      logger.info(
-        { runId: run.id, patientId: patient.id },
-        "Call dispatched successfully"
-      );
-    } catch (error) {
-      logger.error(
-        { error, runId: run.id, patientId: patient.id },
-        "Error dispatching call"
-      );
-      throw error;
-    }
+  private async getNextBatch(runId: string, batchSize: number) {
+    // Query DynamoDB for next batch of calls to make
+    // Implementation depends on data structure
+  }
+
+  private async dispatchCall(call: any, runId: string, orgId: string) {
+    const metadata = {
+      run_id: runId,
+      row_id: call.row_id,
+      org_id: orgId,
+      campaign_id: call.campaign_id
+    };
+
+    await this.retellClient.makeCall({
+      from_number: call.from_number,
+      to_number: call.to_number,
+      override_agent_id: call.agent_id,
+      retell_llm_dynamic_variables: {
+        first_name: call.first_name,
+        last_name: call.last_name,
+        dob: call.dob,
+        is_minor: this.calculateIsMinor(call.dob),
+        phone: call.phone,
+        ...call.campaign_variables
+      },
+      metadata
+    });
+  }
+
+  private calculateIsMinor(dob: string): string {
+    const birthDate = new Date(dob);
+    const age = Math.floor((Date.now() - birthDate.getTime()) / 31557600000);
+    return (age < 18).toString().toUpperCase();
   }
 }
+```
